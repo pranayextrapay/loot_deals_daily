@@ -37,10 +37,10 @@ CHECK_INTERVAL_SECONDS = 180  # Check every 3 minutes
 
 # Search targets across key Flipkart categories
 SEARCH_URLS = [
-    "https://www.flipkart.com/search?q=electronics&sort=price_asc",
-    "https://www.flipkart.com/search?q=headphones&sort=price_asc",
-    "https://www.flipkart.com/search?q=smartwatches&sort=price_asc",
-    "https://www.flipkart.com/search?q=t-shirts&sort=price_asc"
+    "https://www.flipkart.com/search?q=deals&p%5B%5D=facets.discount_range_v1%3D50%2525%2Bor%2Bmore",
+    "https://www.flipkart.com/search?q=headphones&p%5B%5D=facets.discount_range_v1%3D50%2525%2Bor%2Bmore",
+    "https://www.flipkart.com/search?q=smartwatches&p%5B%5D=facets.discount_range_v1%3D50%2525%2Bor%2Bmore",
+    "https://www.flipkart.com/search?q=t-shirts&p%5B%5D=facets.discount_range_v1%3D50%2525%2Bor%2Bmore"
 ]
 
 HEADERS = {
