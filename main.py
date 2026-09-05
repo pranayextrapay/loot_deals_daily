@@ -7,14 +7,14 @@ from bs4 import BeautifulSoup
 from curl_cffi.requests import AsyncSession
 
 # -------------------------------------------------------------
-# 1. RENDER HEALTH CHECK SERVER
+# 1. RENDER PORT LISTENER (Health Check)
 # -------------------------------------------------------------
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.send_header("Content-type", "text/plain")
         self.end_headers()
-        self.wfile.write(b"Bot is alive and running!")
+        self.wfile.write(b"Bot is active and healthy.")
 
     def log_message(self, format, *args):
         return
@@ -25,14 +25,13 @@ def run_health_server():
     server.serve_forever()
 
 # -------------------------------------------------------------
-# 2. CONFIGURATION
+# 2. BOT SETTINGS
 # -------------------------------------------------------------
 BOT_TOKEN = "8916500708:AAGxhpTfz8x9ifJcdiL7loHdnwM0Mch-UtY"
 CHANNEL_USERNAME = "@Daily_loot_deals25"
 DISCOUNT_THRESHOLD = 50
 CHECK_INTERVAL_SECONDS = 60
 
-# Category URLs with pre-applied 50%+ discount filter facets
 SEARCH_URLS = [
     "https://www.flipkart.com/search?q=smartwatches&p%5B%5D=facets.discount_range_v1%3D50%2525%2Bor%2Bmore",
     "https://www.flipkart.com/search?q=headphones&p%5B%5D=facets.discount_range_v1%3D50%2525%2Bor%2Bmore",
@@ -60,12 +59,15 @@ def extract_numeric(text: str) -> int:
     return int(digits) if digits else 0
 
 async def post_to_telegram(session: AsyncSession, title: str, cur_price: int, mrp: int, discount: int, link: str):
+    mrp_line = f"❌ *MRP:* ₹{mrp:,}\n" if mrp > 0 else ""
+    save_line = f"📉 *Discount:* {discount}% OFF\n\n"
+
     message = (
         f"🔥 *LOOT DEAL ({discount}% OFF)* 🔥\n\n"
         f"📦 *Product:* {title}\n"
         f"💰 *Deal Price:* ₹{cur_price:,}\n"
-        f"❌ *MRP:* ₹{mrp:,}\n"
-        f"📉 *Discount:* {discount}% OFF\n\n"
+        f"{mrp_line}"
+        f"{save_line}"
         f"🛒 [Grab Deal on Flipkart]({link})"
     )
 
@@ -81,7 +83,7 @@ async def post_to_telegram(session: AsyncSession, title: str, cur_price: int, mr
         resp = await session.post(telegram_url, json=payload, timeout=15.0)
         res_data = resp.json()
         if res_data.get("ok"):
-            print(f"[+] Posted to Telegram: {title[:35]}... ({discount}%)", flush=True)
+            print(f"[+] Posted to Telegram: {title[:30]}... ({discount}%)", flush=True)
         else:
             print(f"[-] Telegram Error: {res_data}", flush=True)
     except Exception as e:
@@ -89,70 +91,93 @@ async def post_to_telegram(session: AsyncSession, title: str, cur_price: int, mr
 
 async def scan_flipkart_page(session: AsyncSession, url: str):
     try:
+        category_name = url.split("q=")[1].split("&")[0]
         resp = await session.get(url, headers=HEADERS, impersonate="chrome124", timeout=20.0)
-        print(f"[*] Fetched page {url.split('q=')[1].split('&')[0]} -> Status: {resp.status_code}", flush=True)
-
+        
         if resp.status_code != 200:
+            print(f"[-] Blocked on {category_name} (Status: {resp.status_code})", flush=True)
             return
 
         soup = BeautifulSoup(resp.text, "html.parser")
         
-        # Comprehensive selector matching all Flipkart search layouts (grid, list, mobile)
+        # Grab any standard product card or container
         cards = soup.select("div[data-id], div.slAVV4, div._75nlfW, div._1AtVbE")
         deals_posted = 0
 
         for card in cards:
-            # 1. Grab Product URL
+            # 1. Product Link
             link_tag = card.select_one("a[href*='/p/']")
             if not link_tag or not link_tag.get("href"):
                 continue
 
             raw_href = link_tag["href"]
             clean_url = f"https://www.flipkart.com{raw_href.split('?')[0]}"
-
             if clean_url in seen_products:
                 continue
 
-            # 2. Grab Title
-            title_tag = card.select_one("div.KzDlHZ, a.wjcEIp, a.WKTcLC, div._4rR01T, a.s1Q9rs")
-            if not title_tag:
+            # 2. Product Title (multi-layout fallbacks)
+            title = None
+            for sel in ["div.KzDlHZ", "a.wjcEIp", "a.WKTcLC", "div._4rR01T", "a.s1Q9rs", "div.col-7-12 div"]:
+                t_el = card.select_one(sel)
+                if t_el and t_el.get_text(strip=True):
+                    title = t_el.get_text(strip=True)
+                    break
+            
+            if not title:
+                title = link_tag.get("title") or "Flipkart Deal"
+
+            # 3. Selling Price
+            cur_price = 0
+            for sel in ["div.Nx9bqj", "div._30jeq3", "div.hl05eU div", "div._25b18c div:first-child"]:
+                p_el = card.select_one(sel)
+                if p_el and "₹" in p_el.get_text():
+                    cur_price = extract_numeric(p_el.get_text())
+                    break
+
+            if not cur_price:
                 continue
-            title = title_tag.get_text(strip=True)
 
-            # 3. Grab Prices
-            cur_price_tag = card.select_one("div.Nx9bqj, div._30jeq3")
-            mrp_tag = card.select_one("div.yRaY8j, div._3I9_wc")
+            # 4. MRP & Discount Calculation
+            mrp = 0
+            for sel in ["div.yRaY8j", "div._3I9_wc", "div._25b18c div._3I9_wc", "div.strike"]:
+                m_el = card.select_one(sel)
+                if m_el and ("₹" in m_el.get_text() or m_el.get_text().strip().isdigit()):
+                    mrp = extract_numeric(m_el.get_text())
+                    break
 
-            if not cur_price_tag or not mrp_tag:
-                continue
-
-            cur_price = extract_numeric(cur_price_tag.get_text())
-            mrp = extract_numeric(mrp_tag.get_text())
-
-            if mrp > 0 and cur_price < mrp:
+            discount = 0
+            if mrp > cur_price:
                 discount = round(((mrp - cur_price) / mrp) * 100)
+            else:
+                # Direct discount badge fallback (e.g., '70% off')
+                disc_badge = card.select_one("div.UkUFwK span, div._3Ay6Sb span, span.row")
+                if disc_badge:
+                    badge_match = re.search(r"(\d+)%", disc_badge.get_text())
+                    if badge_match:
+                        discount = int(badge_match.group(1))
 
-                if discount >= DISCOUNT_THRESHOLD:
-                    seen_products.add(clean_url)
-                    deals_posted += 1
-                    await post_to_telegram(session, title, cur_price, mrp, discount, clean_url)
+            # Trigger post if discount satisfies condition
+            if discount >= DISCOUNT_THRESHOLD:
+                seen_products.add(clean_url)
+                deals_posted += 1
+                await post_to_telegram(session, title, cur_price, mrp, discount, clean_url)
 
-        print(f"[*] Processed {len(cards)} items, posted {deals_posted} deals.", flush=True)
+        print(f"[*] Fetched {category_name}: Found {len(cards)} items -> Dispatched {deals_posted} deals.", flush=True)
 
     except Exception as err:
         print(f"[-] Scrape error: {err}", flush=True)
 
 async def main():
-    print("[*] Bot starting HTML parser with Chrome TLS impersonation...", flush=True)
+    print("[*] Launching multi-selector discount parser...", flush=True)
     threading.Thread(target=run_health_server, daemon=True).start()
-    print("[+] Port 10000 bound.", flush=True)
+    print("[+] Port 10000 active.", flush=True)
 
     async with AsyncSession() as session:
         while True:
             print("[*] Starting sweep...", flush=True)
             for url in SEARCH_URLS:
                 await scan_flipkart_page(session, url)
-                await asyncio.sleep(3)
+                await asyncio.sleep(2)
 
             print(f"[*] Sweep done. Pausing for {CHECK_INTERVAL_SECONDS}s...", flush=True)
             await asyncio.sleep(CHECK_INTERVAL_SECONDS)
