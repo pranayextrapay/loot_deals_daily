@@ -7,7 +7,7 @@ from bs4 import BeautifulSoup
 from curl_cffi.requests import AsyncSession
 
 # -------------------------------------------------------------
-# 1. RENDER HEALTH CHECK SERVER
+# 1. RENDER PORT LISTENER (Health Check)
 # -------------------------------------------------------------
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -30,23 +30,22 @@ def run_health_server():
 BOT_TOKEN = "8916500708:AAF4bTn5L9k7kabQD-xokUPCF16-OzWfGfU"
 CHANNEL_USERNAME = "@Daily_loot_deals25"
 
-# Lowered slightly to 70% to ensure steady flow; set to 80 if you want strictly rare drops
-DISCOUNT_THRESHOLD = 70  
-CHECK_INTERVAL_SECONDS = 180
-MESSAGE_DELAY_SECONDS = 3.5
+DISCOUNT_THRESHOLD = 70       # 70%+ deals guaranteed to find steady hits
+CHECK_INTERVAL_SECONDS = 180   # 3-minute sweep cycle
+MESSAGE_DELAY_SECONDS = 3.5    # Telegram rate limit protector
 
-# High-yield categories known for steep discounts
+# Categories targeted with Flipkart's high-discount sorting & filter tags
 SEARCH_URLS = [
-    "https://www.flipkart.com/search?q=clearance+sale",
-    "https://www.flipkart.com/search?q=smartwatches&sort=price_asc",
-    "https://www.flipkart.com/search?q=headphones&sort=price_asc",
-    "https://www.flipkart.com/search?q=shoes&sort=price_asc",
-    "https://www.flipkart.com/search?q=t-shirts&sort=price_asc",
-    "https://www.flipkart.com/search?q=backpacks&sort=price_asc",
-    "https://www.flipkart.com/search?q=mobile+accessories&sort=price_asc",
-    "https://www.flipkart.com/search?q=home+decor&sort=price_asc",
-    "https://www.flipkart.com/search?q=sunglasses&sort=price_asc",
-    "https://www.flipkart.com/search?q=trimmers&sort=price_asc"
+    "https://www.flipkart.com/search?q=smartwatches&p%5B%5D=facets.discount_range_v1%3D70%2525%2Bor%2Bmore",
+    "https://www.flipkart.com/search?q=headphones&p%5B%5D=facets.discount_range_v1%3D70%2525%2Bor%2Bmore",
+    "https://www.flipkart.com/search?q=mens+footwear&p%5B%5D=facets.discount_range_v1%3D70%2525%2Bor%2Bmore",
+    "https://www.flipkart.com/search?q=t-shirts&p%5B%5D=facets.discount_range_v1%3D70%2525%2Bor%2Bmore",
+    "https://www.flipkart.com/search?q=backpacks&p%5B%5D=facets.discount_range_v1%3D70%2525%2Bor%2Bmore",
+    "https://www.flipkart.com/search?q=sunglasses&p%5B%5D=facets.discount_range_v1%3D70%2525%2Bor%2Bmore",
+    "https://www.flipkart.com/search?q=wall+clocks&p%5B%5D=facets.discount_range_v1%3D70%2525%2Bor%2Bmore",
+    "https://www.flipkart.com/search?q=bedsheets&p%5B%5D=facets.discount_range_v1%3D70%2525%2Bor%2Bmore",
+    "https://www.flipkart.com/search?q=trimmers&p%5B%5D=facets.discount_range_v1%3D60%2525%2Bor%2Bmore",
+    "https://www.flipkart.com/search?q=powerbank&p%5B%5D=facets.discount_range_v1%3D60%2525%2Bor%2Bmore"
 ]
 
 HEADERS = {
@@ -128,11 +127,11 @@ async def scan_flipkart_page(session: AsyncSession, url: str):
 
             card_text = card.get_text(" ", strip=True)
 
-            # In-Stock Verification
+            # Stock check
             if any(term in card_text.lower() for term in ["out of stock", "sold out", "currently unavailable"]):
                 continue
 
-            # Robust Price Parsing across all responsive card templates
+            # Price extraction
             cur_price_el = card.select_one("div.Nx9bqj, div._30jeq3")
             mrp_el = card.select_one("div.yRaY8j, div._3I9_wc")
             disc_el = card.select_one("div.UkUFwK span, div._3Ay6Sb span")
@@ -140,7 +139,7 @@ async def scan_flipkart_page(session: AsyncSession, url: str):
             cur_price = extract_numeric(cur_price_el.get_text()) if cur_price_el else 0
             mrp = extract_numeric(mrp_el.get_text()) if mrp_el else 0
 
-            # Fallback: Extract from isolated pricing spans
+            # Fallback regex search on the card
             if cur_price == 0:
                 price_matches = re.findall(r"₹([\d,]+)", card_text)
                 if price_matches:
@@ -151,7 +150,6 @@ async def scan_flipkart_page(session: AsyncSession, url: str):
             if cur_price == 0:
                 continue
 
-            # Calculate Discount Percentage
             discount = 0
             if disc_el:
                 disc_match = re.search(r"(\d+)%", disc_el.get_text())
@@ -161,7 +159,7 @@ async def scan_flipkart_page(session: AsyncSession, url: str):
             if discount == 0 and mrp > cur_price:
                 discount = round(((mrp - cur_price) / mrp) * 100)
 
-            # Strict discount and price verification
+            # Check threshold
             if discount >= DISCOUNT_THRESHOLD and (mrp == 0 or cur_price < mrp):
                 title_tag = card.select_one("div.KzDlHZ, a.wjcEIp, a.WKTcLC, div._4rR01T, a.s1Q9rs")
                 title = title_tag.get_text(strip=True) if title_tag else (link_tag.get("title") or "Flipkart Loot Deal")
@@ -176,7 +174,7 @@ async def scan_flipkart_page(session: AsyncSession, url: str):
         print(f"[-] Scrape error on {category}: {err}", flush=True)
 
 async def main():
-    print("[*] Bot running: Universal price selector active...", flush=True)
+    print("[*] Bot running: Targeted high-discount categories active...", flush=True)
     threading.Thread(target=run_health_server, daemon=True).start()
     print("[+] Port 10000 bound.", flush=True)
 
