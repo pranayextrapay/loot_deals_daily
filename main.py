@@ -6,13 +6,14 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 from curl_cffi.requests import AsyncSession
 
 # -------------------------------------------------------------
-# 1. RENDER PORT LISTENER
+# 1. RENDER PORT LISTENER (Health Check)
 # -------------------------------------------------------------
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
+        self.send_header("Content-type", "text/plain")
         self.end_headers()
-        self.wfile.write(b"Bot is alive!")
+        self.wfile.write(b"Bot is alive and running!")
 
     def log_message(self, format, *args):
         return
@@ -23,12 +24,12 @@ def run_health_server():
     server.serve_forever()
 
 # -------------------------------------------------------------
-# 2. BOT SETTINGS
+# 2. CONFIGURATION
 # -------------------------------------------------------------
 BOT_TOKEN = "8916500708:AAGxhpTfz8x9ifJcdiL7loHdnwM0Mch-UtY"
 CHANNEL_USERNAME = "@Daily_loot_deals25"
-DISCOUNT_THRESHOLD = 50  # 50% or higher
-CHECK_INTERVAL_SECONDS = 60  # Check every 60 seconds
+DISCOUNT_THRESHOLD = 50
+CHECK_INTERVAL_SECONDS = 60
 
 SEARCH_QUERIES = [
     "deals",
@@ -40,6 +41,9 @@ SEARCH_QUERIES = [
 
 seen_products = set()
 
+# -------------------------------------------------------------
+# 3. CORE LOGIC
+# -------------------------------------------------------------
 async def post_to_telegram(session: AsyncSession, title: str, cur_price: int, mrp: int, discount: int, link: str):
     message = (
         f"🔥 *LOOT DEAL ({discount}% OFF)* 🔥\n\n"
@@ -69,7 +73,7 @@ async def post_to_telegram(session: AsyncSession, title: str, cur_price: int, mr
         print(f"[-] Telegram dispatch error: {e}", flush=True)
 
 async def scan_flipkart_query(session: AsyncSession, query: str):
-    url = f"https://www.flipkart.com/api/4/page/fetch"
+    url = "https://www.flipkart.com/api/4/page/fetch"
     payload = {
         "pageUri": f"/search?q={query}&p%5B%5D=facets.discount_range_v1%3D50%2525%2Bor%2Bmore",
         "locationContext": {"pincode": "500001"}
@@ -82,34 +86,36 @@ async def scan_flipkart_query(session: AsyncSession, query: str):
 
     try:
         resp = await session.post(url, json=payload, headers=headers, impersonate="chrome", timeout=15.0)
+        print(f"[*] Query '{query}' returned HTTP status: {resp.status_code}", flush=True)
+
         if resp.status_code != 200:
-            # Fallback to direct web scraping if API endpoint shifts
+            print(f"[-] Non-200 Body response snippet: {resp.text[:120]}", flush=True)
             return
 
         data = resp.json()
         slots = data.get("RESPONSE", {}).get("slots", [])
-        
+
         deals_found = 0
         for slot in slots:
             widget = slot.get("widget", {})
             elements = widget.get("data", {}).get("products", [])
-            
+
             for p in elements:
                 p_val = p.get("productInfo", {}).get("value", {})
                 pricing = p_val.get("pricing", {})
-                
+
                 cur_price = pricing.get("finalPrice", {}).get("value", 0)
                 mrp = pricing.get("mrp", {}).get("value", 0)
                 discount = pricing.get("totalDiscount", 0)
-                
+
                 title = p_val.get("titles", {}).get("title", "Loot Deal")
                 base_url = p_val.get("smartUrl", "")
-                
+
                 if not base_url:
                     continue
-                    
+
                 full_url = f"https://www.flipkart.com{base_url.split('?')[0]}"
-                
+
                 if full_url in seen_products:
                     continue
 
@@ -124,10 +130,15 @@ async def scan_flipkart_query(session: AsyncSession, query: str):
     except Exception as err:
         print(f"[-] Scan error on '{query}': {err}", flush=True)
 
+# -------------------------------------------------------------
+# 4. RUNNER
+# -------------------------------------------------------------
 async def main():
-    print("[*] Bot active with JSON API parser...", flush=True)
+    print("[*] Starting deal worker with HTTP logger...", flush=True)
+
+    # Launch daemon background thread to keep Render happy
     threading.Thread(target=run_health_server, daemon=True).start()
-    print("[+] Health port 10000 bound.", flush=True)
+    print("[+] Port listener bound to 10000.", flush=True)
 
     async with AsyncSession() as session:
         while True:
