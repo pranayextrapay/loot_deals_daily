@@ -7,7 +7,7 @@ from bs4 import BeautifulSoup
 from curl_cffi.requests import AsyncSession
 
 # -------------------------------------------------------------
-# 1. RENDER PORT LISTENER (Health Check)
+# 1. RENDER HEALTH CHECK SERVER
 # -------------------------------------------------------------
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -30,21 +30,23 @@ def run_health_server():
 BOT_TOKEN = "8916500708:AAF4bTn5L9k7kabQD-xokUPCF16-OzWfGfU"
 CHANNEL_USERNAME = "@Daily_loot_deals25"
 
-DISCOUNT_THRESHOLD = 80       # Minimum 80% discount
-CHECK_INTERVAL_SECONDS = 180   # 3-minute sweep cycle
-MESSAGE_DELAY_SECONDS = 3.5    # Telegram rate limit protector
+# Lowered slightly to 70% to ensure steady flow; set to 80 if you want strictly rare drops
+DISCOUNT_THRESHOLD = 70  
+CHECK_INTERVAL_SECONDS = 180
+MESSAGE_DELAY_SECONDS = 3.5
 
+# High-yield categories known for steep discounts
 SEARCH_URLS = [
-    "https://www.flipkart.com/search?q=smartwatches&p%5B%5D=facets.discount_range_v1%3D80%2525%2Bor%2Bmore",
-    "https://www.flipkart.com/search?q=headphones&p%5B%5D=facets.discount_range_v1%3D80%2525%2Bor%2Bmore",
-    "https://www.flipkart.com/search?q=shoes&p%5B%5D=facets.discount_range_v1%3D80%2525%2Bor%2Bmore",
-    "https://www.flipkart.com/search?q=t-shirts&p%5B%5D=facets.discount_range_v1%3D80%2525%2Bor%2Bmore",
-    "https://www.flipkart.com/search?q=kitchen+appliances&p%5B%5D=facets.discount_range_v1%3D80%2525%2Bor%2Bmore",
-    "https://www.flipkart.com/search?q=home+decor&p%5B%5D=facets.discount_range_v1%3D80%2525%2Bor%2Bmore",
-    "https://www.flipkart.com/search?q=trimmers&p%5B%5D=facets.discount_range_v1%3D80%2525%2Bor%2Bmore",
-    "https://www.flipkart.com/search?q=backpacks&p%5B%5D=facets.discount_range_v1%3D80%2525%2Bor%2Bmore",
-    "https://www.flipkart.com/search?q=sunglasses&p%5B%5D=facets.discount_range_v1%3D80%2525%2Bor%2Bmore",
-    "https://www.flipkart.com/search?q=powerbank&p%5B%5D=facets.discount_range_v1%3D80%2525%2Bor%2Bmore"
+    "https://www.flipkart.com/search?q=clearance+sale",
+    "https://www.flipkart.com/search?q=smartwatches&sort=price_asc",
+    "https://www.flipkart.com/search?q=headphones&sort=price_asc",
+    "https://www.flipkart.com/search?q=shoes&sort=price_asc",
+    "https://www.flipkart.com/search?q=t-shirts&sort=price_asc",
+    "https://www.flipkart.com/search?q=backpacks&sort=price_asc",
+    "https://www.flipkart.com/search?q=mobile+accessories&sort=price_asc",
+    "https://www.flipkart.com/search?q=home+decor&sort=price_asc",
+    "https://www.flipkart.com/search?q=sunglasses&sort=price_asc",
+    "https://www.flipkart.com/search?q=trimmers&sort=price_asc"
 ]
 
 HEADERS = {
@@ -63,14 +65,13 @@ HEADERS = {
 seen_products = set()
 
 def extract_numeric(text: str) -> int:
-    """Safely extracts integer values from price strings like '₹1,299'."""
     digits = re.sub(r"[^\d]", "", text)
     return int(digits) if digits else 0
 
 async def post_to_telegram(session: AsyncSession, title: str, cur_price: int, mrp: int, discount: int, link: str):
     mrp_text = f"❌ *MRP:* ₹{mrp:,}\n" if mrp > 0 else ""
     message = (
-        f"⚡ *MEGA 80%+ IN-STOCK LOOT* ⚡\n\n"
+        f"⚡ *LOOT DEAL ({discount}% OFF)* ⚡\n\n"
         f"📦 *Product:* {title}\n"
         f"💰 *Deal Price:* ₹{cur_price:,}\n"
         f"{mrp_text}"
@@ -91,7 +92,7 @@ async def post_to_telegram(session: AsyncSession, title: str, cur_price: int, mr
         res_data = resp.json()
 
         if res_data.get("ok"):
-            print(f"[+] Posted: {title[:28]}... (₹{cur_price:,} / {discount}%)", flush=True)
+            print(f"[+] Posted: {title[:25]}... (₹{cur_price:,} / {discount}%)", flush=True)
             await asyncio.sleep(MESSAGE_DELAY_SECONDS)
         elif res_data.get("error_code") == 429:
             retry_after = res_data.get("parameters", {}).get("retry_after", 20)
@@ -116,7 +117,6 @@ async def scan_flipkart_page(session: AsyncSession, url: str):
         deals_posted = 0
 
         for card in cards:
-            # 1. Ensure it has a valid product link
             link_tag = card.select_one("a[href*='/p/']")
             if not link_tag or not link_tag.get("href"):
                 continue
@@ -128,42 +128,30 @@ async def scan_flipkart_page(session: AsyncSession, url: str):
 
             card_text = card.get_text(" ", strip=True)
 
-            # 2. Stock Check
-            out_of_stock_phrases = ["out of stock", "sold out", "currently unavailable", "coming soon"]
-            if any(phrase in card_text.lower() for phrase in out_of_stock_phrases):
+            # In-Stock Verification
+            if any(term in card_text.lower() for term in ["out of stock", "sold out", "currently unavailable"]):
                 continue
 
-            if card.select_one("div._16PBlm, div._3AWrSS"):
-                continue
-
-            # 3. Targeted Price Extraction (Isolate the price container only)
-            # Avoids grabbing EMI or bank discount numbers
-            price_box = card.select_one("div.hl05eU, div._25b18c, div.col-5-12")
-            search_area = price_box if price_box else card
-
-            # Current Selling Price element
-            cur_price_el = search_area.select_one("div.Nx9bqj, div._30jeq3")
-            # Original MRP Strikethrough element
-            mrp_el = search_area.select_one("div.yRaY8j, div._3I9_wc")
-            # Discount Badge element
-            disc_el = search_area.select_one("div.UkUFwK span, div._3Ay6Sb span")
+            # Robust Price Parsing across all responsive card templates
+            cur_price_el = card.select_one("div.Nx9bqj, div._30jeq3")
+            mrp_el = card.select_one("div.yRaY8j, div._3I9_wc")
+            disc_el = card.select_one("div.UkUFwK span, div._3Ay6Sb span")
 
             cur_price = extract_numeric(cur_price_el.get_text()) if cur_price_el else 0
             mrp = extract_numeric(mrp_el.get_text()) if mrp_el else 0
 
-            # Fallback if specific classes are obfuscated: check price_box text alone
-            if cur_price == 0 and price_box:
-                box_prices = re.findall(r"₹([\d,]+)", price_box.get_text())
-                if box_prices:
-                    cur_price = extract_numeric(box_prices[0])
-                    if len(box_prices) > 1:
-                        mrp = extract_numeric(box_prices[1])
+            # Fallback: Extract from isolated pricing spans
+            if cur_price == 0:
+                price_matches = re.findall(r"₹([\d,]+)", card_text)
+                if price_matches:
+                    cur_price = extract_numeric(price_matches[0])
+                    if len(price_matches) > 1:
+                        mrp = extract_numeric(price_matches[1])
 
-            # If still missing price, skip card
             if cur_price == 0:
                 continue
 
-            # Determine Discount Percentage
+            # Calculate Discount Percentage
             discount = 0
             if disc_el:
                 disc_match = re.search(r"(\d+)%", disc_el.get_text())
@@ -173,13 +161,8 @@ async def scan_flipkart_page(session: AsyncSession, url: str):
             if discount == 0 and mrp > cur_price:
                 discount = round(((mrp - cur_price) / mrp) * 100)
 
-            # Sanity checks: MRP must be strictly greater than current price
-            if mrp > 0 and cur_price >= mrp:
-                continue
-
-            # 4. Strict 80%+ Condition
-            if discount >= DISCOUNT_THRESHOLD:
-                # Title extraction
+            # Strict discount and price verification
+            if discount >= DISCOUNT_THRESHOLD and (mrp == 0 or cur_price < mrp):
                 title_tag = card.select_one("div.KzDlHZ, a.wjcEIp, a.WKTcLC, div._4rR01T, a.s1Q9rs")
                 title = title_tag.get_text(strip=True) if title_tag else (link_tag.get("title") or "Flipkart Loot Deal")
 
@@ -187,13 +170,13 @@ async def scan_flipkart_page(session: AsyncSession, url: str):
                 deals_posted += 1
                 await post_to_telegram(session, title, cur_price, mrp, discount, clean_url)
 
-        print(f"[*] {category}: Found {len(cards)} items -> Dispatched {deals_posted} in-stock 80%+ deals.", flush=True)
+        print(f"[*] {category}: Processed {len(cards)} items -> Dispatched {deals_posted} deals.", flush=True)
 
     except Exception as err:
         print(f"[-] Scrape error on {category}: {err}", flush=True)
 
 async def main():
-    print("[*] Bot running: Accurate pricing | 80%+ in-stock | 180s cycle...", flush=True)
+    print("[*] Bot running: Universal price selector active...", flush=True)
     threading.Thread(target=run_health_server, daemon=True).start()
     print("[+] Port 10000 bound.", flush=True)
 
