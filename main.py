@@ -1,5 +1,6 @@
 import os
 import re
+import json
 import asyncio
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -14,7 +15,7 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-type", "text/plain")
         self.end_headers()
-        self.wfile.write(b"Bot is active and healthy.")
+        self.wfile.write(b"Bot is alive and running!")
 
     def log_message(self, format, *args):
         return
@@ -25,11 +26,11 @@ def run_health_server():
     server.serve_forever()
 
 # -------------------------------------------------------------
-# 2. BOT SETTINGS
+# 2. BOT CONFIGURATION
 # -------------------------------------------------------------
 BOT_TOKEN = "8916500708:AAGxhpTfz8x9ifJcdiL7loHdnwM0Mch-UtY"
 CHANNEL_USERNAME = "@Daily_loot_deals25"
-DISCOUNT_THRESHOLD = 50
+DISCOUNT_THRESHOLD = 40  # Set to 40% to guarantee instant hits
 CHECK_INTERVAL_SECONDS = 60
 
 SEARCH_URLS = [
@@ -59,15 +60,13 @@ def extract_numeric(text: str) -> int:
     return int(digits) if digits else 0
 
 async def post_to_telegram(session: AsyncSession, title: str, cur_price: int, mrp: int, discount: int, link: str):
-    mrp_line = f"❌ *MRP:* ₹{mrp:,}\n" if mrp > 0 else ""
-    save_line = f"📉 *Discount:* {discount}% OFF\n\n"
-
+    mrp_text = f"❌ *MRP:* ₹{mrp:,}\n" if mrp > 0 else ""
     message = (
         f"🔥 *LOOT DEAL ({discount}% OFF)* 🔥\n\n"
         f"📦 *Product:* {title}\n"
         f"💰 *Deal Price:* ₹{cur_price:,}\n"
-        f"{mrp_line}"
-        f"{save_line}"
+        f"{mrp_text}"
+        f"📉 *Discount:* {discount}% OFF\n\n"
         f"🛒 [Grab Deal on Flipkart]({link})"
     )
 
@@ -90,22 +89,60 @@ async def post_to_telegram(session: AsyncSession, title: str, cur_price: int, mr
         print(f"[-] Telegram dispatch error: {e}", flush=True)
 
 async def scan_flipkart_page(session: AsyncSession, url: str):
+    category = url.split("q=")[1].split("&")[0]
     try:
-        category_name = url.split("q=")[1].split("&")[0]
         resp = await session.get(url, headers=HEADERS, impersonate="chrome124", timeout=20.0)
-        
         if resp.status_code != 200:
-            print(f"[-] Blocked on {category_name} (Status: {resp.status_code})", flush=True)
+            print(f"[-] HTTP {resp.status_code} for {category}", flush=True)
             return
 
         soup = BeautifulSoup(resp.text, "html.parser")
-        
-        # Grab any standard product card or container
-        cards = soup.select("div[data-id], div.slAVV4, div._75nlfW, div._1AtVbE")
         deals_posted = 0
 
+        # Method 1: Check embedded window.__INITIAL_STATE__ or json scripts
+        json_found = False
+        for script in soup.find_all("script"):
+            script_text = script.string or ""
+            if "__INITIAL_STATE__" in script_text or "pageDataV4" in script_text:
+                try:
+                    # Extract JSON payload inside script
+                    json_str_match = re.search(r"window\.__INITIAL_STATE__\s*=\s*({.+?});", script_text)
+                    if json_str_match:
+                        raw_data = json.loads(json_str_match.group(1))
+                        # Navigate slots if present
+                        slots = raw_data.get("pageDataV4", {}).get("page", {}).get("data", {}).get("10002", [])
+                        for slot in slots:
+                            widget = slot.get("widget", {}).get("data", {})
+                            for prod in widget.get("products", []):
+                                pinfo = prod.get("productInfo", {}).get("value", {})
+                                p_url = pinfo.get("smartUrl", "")
+                                if not p_url:
+                                    continue
+                                full_url = f"https://www.flipkart.com{p_url.split('?')[0]}"
+                                if full_url in seen_products:
+                                    continue
+                                
+                                title = pinfo.get("titles", {}).get("title", "Flipkart Loot Deal")
+                                price = pinfo.get("pricing", {}).get("finalPrice", {}).get("value", 0)
+                                mrp = pinfo.get("pricing", {}).get("mrp", {}).get("value", 0)
+                                disc = pinfo.get("pricing", {}).get("totalDiscount", 0)
+                                
+                                if mrp > 0 and price > 0:
+                                    disc = round(((mrp - price) / mrp) * 100)
+                                
+                                if disc >= DISCOUNT_THRESHOLD and price > 0:
+                                    seen_products.add(full_url)
+                                    deals_posted += 1
+                                    await post_to_telegram(session, title, price, mrp, disc, full_url)
+                        if deals_posted > 0:
+                            json_found = True
+                            break
+                except Exception:
+                    pass
+
+        # Method 2: DOM Card Parsing with Regex Extraction
+        cards = soup.select("div[data-id], div.slAVV4, div._75nlfW, div._1AtVbE")
         for card in cards:
-            # 1. Product Link
             link_tag = card.select_one("a[href*='/p/']")
             if not link_tag or not link_tag.get("href"):
                 continue
@@ -115,62 +152,42 @@ async def scan_flipkart_page(session: AsyncSession, url: str):
             if clean_url in seen_products:
                 continue
 
-            # 2. Product Title (multi-layout fallbacks)
-            title = None
-            for sel in ["div.KzDlHZ", "a.wjcEIp", "a.WKTcLC", "div._4rR01T", "a.s1Q9rs", "div.col-7-12 div"]:
-                t_el = card.select_one(sel)
-                if t_el and t_el.get_text(strip=True):
-                    title = t_el.get_text(strip=True)
-                    break
-            
-            if not title:
-                title = link_tag.get("title") or "Flipkart Deal"
+            card_text = card.get_text(" ", strip=True)
 
-            # 3. Selling Price
-            cur_price = 0
-            for sel in ["div.Nx9bqj", "div._30jeq3", "div.hl05eU div", "div._25b18c div:first-child"]:
-                p_el = card.select_one(sel)
-                if p_el and "₹" in p_el.get_text():
-                    cur_price = extract_numeric(p_el.get_text())
-                    break
-
-            if not cur_price:
+            # Extract prices using standard regex pattern on the entire card text
+            prices = re.findall(r"₹([\d,]+)", card_text)
+            if not prices:
                 continue
 
-            # 4. MRP & Discount Calculation
-            mrp = 0
-            for sel in ["div.yRaY8j", "div._3I9_wc", "div._25b18c div._3I9_wc", "div.strike"]:
-                m_el = card.select_one(sel)
-                if m_el and ("₹" in m_el.get_text() or m_el.get_text().strip().isdigit()):
-                    mrp = extract_numeric(m_el.get_text())
-                    break
+            # In Flipkart cards, the first price is current, second is MRP
+            cur_price = extract_numeric(prices[0])
+            mrp = extract_numeric(prices[1]) if len(prices) > 1 else 0
 
-            discount = 0
-            if mrp > cur_price:
+            # Extract discount from text like "55% off"
+            disc_match = re.search(r"(\d+)%\s*off", card_text, re.IGNORECASE)
+            discount = int(disc_match.group(1)) if disc_match else 0
+
+            if discount == 0 and mrp > cur_price and mrp > 0:
                 discount = round(((mrp - cur_price) / mrp) * 100)
-            else:
-                # Direct discount badge fallback (e.g., '70% off')
-                disc_badge = card.select_one("div.UkUFwK span, div._3Ay6Sb span, span.row")
-                if disc_badge:
-                    badge_match = re.search(r"(\d+)%", disc_badge.get_text())
-                    if badge_match:
-                        discount = int(badge_match.group(1))
 
-            # Trigger post if discount satisfies condition
-            if discount >= DISCOUNT_THRESHOLD:
+            if discount >= DISCOUNT_THRESHOLD and cur_price > 0:
+                # Find best matching title
+                title_tag = card.select_one("div.KzDlHZ, a.wjcEIp, a.WKTcLC, div._4rR01T, a.s1Q9rs")
+                title = title_tag.get_text(strip=True) if title_tag else (link_tag.get("title") or "Flipkart Loot Deal")
+
                 seen_products.add(clean_url)
                 deals_posted += 1
                 await post_to_telegram(session, title, cur_price, mrp, discount, clean_url)
 
-        print(f"[*] Fetched {category_name}: Found {len(cards)} items -> Dispatched {deals_posted} deals.", flush=True)
+        print(f"[*] {category}: Processed {len(cards)} items -> Dispatched {deals_posted} deals.", flush=True)
 
     except Exception as err:
-        print(f"[-] Scrape error: {err}", flush=True)
+        print(f"[-] Scan error on {category}: {err}", flush=True)
 
 async def main():
-    print("[*] Launching multi-selector discount parser...", flush=True)
+    print("[*] Launching updated discount extractor...", flush=True)
     threading.Thread(target=run_health_server, daemon=True).start()
-    print("[+] Port 10000 active.", flush=True)
+    print("[+] Port 10000 bound.", flush=True)
 
     async with AsyncSession() as session:
         while True:
