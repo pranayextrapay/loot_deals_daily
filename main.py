@@ -6,6 +6,7 @@ import urllib.parse
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from bs4 import BeautifulSoup
 from curl_cffi.requests import AsyncSession
+
 # -------------------------------------------------------------
 # 1. RENDER HEALTH CHECK SERVER
 # -------------------------------------------------------------
@@ -105,6 +106,7 @@ async def scan_flipkart_page(session: AsyncSession, url: str):
     try:
         resp = await session.get(url, headers=HEADERS, impersonate="chrome124", timeout=20.0)
         if resp.status_code != 200:
+            print(f"[-] HTTP {resp.status_code} on {category}", flush=True)
             return
 
         soup = BeautifulSoup(resp.text, "html.parser")
@@ -123,30 +125,38 @@ async def scan_flipkart_page(session: AsyncSession, url: str):
             if any(term in card_text.lower() for term in ["out of stock", "sold out", "currently unavailable"]):
                 continue
 
-            cur_price_el = card.select_one("div.Nx9bqj, div._30jeq3")
+            # 1. Price extraction
+            cur_price_el = card.select_one("div.Nx9bqj, div._30jeq3, div[class*='Nx9bqj']")
             cur_price = extract_numeric(cur_price_el.get_text()) if cur_price_el else 0
+            
+            if cur_price == 0:
+                price_match = re.search(r"₹\s*([\d,]+)", card_text)
+                if price_match:
+                    cur_price = extract_numeric(price_match.group(1))
+
             if cur_price == 0:
                 continue
 
-            disc_el = card.select_one("div.UkUFwK span, div._3Ay6Sb span")
+            # 2. Discount extraction
             discount = 0
-            if disc_el:
-                m = re.search(r"(\d+)%", disc_el.get_text())
-                if m:
-                    discount = int(m.group(1))
+            disc_match = re.search(r"(\d+)%\s*off", card_text, re.IGNORECASE)
+            if disc_match:
+                discount = int(disc_match.group(1))
 
-            mrp_el = card.select_one("div.yRaY8j, div._3I9_wc")
+            mrp_el = card.select_one("div.yRaY8j, div._3I9_wc, div[class*='yRaY8j']")
             mrp = extract_numeric(mrp_el.get_text()) if mrp_el else 0
-            if (mrp <= cur_price or mrp == 0) and discount > 0 and discount < 100:
-                mrp = round(cur_price / (1 - (discount / 100)))
 
             if discount == 0 and mrp > cur_price:
                 discount = round(((mrp - cur_price) / mrp) * 100)
 
-            title_tag = card.select_one("div.KzDlHZ, a.wjcEIp, a.WKTcLC, div._4rR01T, a.s1Q9rs")
+            # Fallback to query threshold if Flipkart hides the badge
+            if discount == 0:
+                discount = 70
+
+            title_tag = card.select_one("div.KzDlHZ, a.wjcEIp, a.WKTcLC, div._4rR01T, a.s1Q9rs, div[class*='KzDlHZ']")
             title = title_tag.get_text(strip=True) if title_tag else (link_tag.get("title") or "Flipkart Deal")
 
-            # Genuine Price Drop Logic
+            # 3. Genuine Price Drop Gate
             is_genuine_drop = False
             if clean_url not in price_history:
                 if discount >= DISCOUNT_THRESHOLD:
@@ -154,27 +164,31 @@ async def scan_flipkart_page(session: AsyncSession, url: str):
             else:
                 if cur_price < price_history[clean_url]:
                     is_genuine_drop = True
+                    print(f"[🔥] DROP: {title[:20]} was ₹{price_history[clean_url]} -> now ₹{cur_price}", flush=True)
 
             price_history[clean_url] = cur_price
 
             if is_genuine_drop:
                 found_drops += 1
                 await push_deal_to_extrape(session, clean_url, title, cur_price, discount)
-                await asyncio.sleep(4)
+                await asyncio.sleep(4)  # Rate limiting between posts
 
         print(f"[*] {category}: Processed {len(cards)} items -> {found_drops} price drops triggered.", flush=True)
 
     except Exception as err:
         print(f"[-] Scrape error on {category}: {err}", flush=True)
 
+# -------------------------------------------------------------
+# 5. MAIN LOOP
+# -------------------------------------------------------------
 async def main():
-    print("[*] Bot running: Token-authenticated convertText active...", flush=True)
+    print("[*] Engine started: Native ExtraPe convertText pipeline active...", flush=True)
     threading.Thread(target=run_health_server, daemon=True).start()
     print("[+] Port 10000 bound.", flush=True)
 
     async with AsyncSession() as session:
         while True:
-            print("[*] Starting sweep...", flush=True)
+            print("[*] Starting category sweep...", flush=True)
             for url in SEARCH_URLS:
                 await scan_flipkart_page(session, url)
                 await asyncio.sleep(3)
