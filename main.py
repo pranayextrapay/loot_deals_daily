@@ -6,7 +6,6 @@ import urllib.parse
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from bs4 import BeautifulSoup
 from curl_cffi.requests import AsyncSession
-
 # -------------------------------------------------------------
 # 1. RENDER HEALTH CHECK SERVER
 # -------------------------------------------------------------
