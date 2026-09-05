@@ -1,6 +1,5 @@
 import os
 import re
-import json
 import asyncio
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -15,7 +14,7 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-type", "text/plain")
         self.end_headers()
-        self.wfile.write(b"Bot is alive and running!")
+        self.wfile.write(b"Bot is alive and monitoring 80%+ deals.")
 
     def log_message(self, format, *args):
         return
@@ -30,15 +29,24 @@ def run_health_server():
 # -------------------------------------------------------------
 BOT_TOKEN = "8916500708:AAGxhpTfz8x9ifJcdiL7loHdnwM0Mch-UtY"
 CHANNEL_USERNAME = "@Daily_loot_deals25"
-DISCOUNT_THRESHOLD = 50  # 50% or higher
-CHECK_INTERVAL_SECONDS = 90
-MESSAGE_DELAY_SECONDS = 3.5  # Prevents Telegram 429 rate-limiting
 
+# Strict 80%+ filter
+DISCOUNT_THRESHOLD = 80  
+CHECK_INTERVAL_SECONDS = 120
+MESSAGE_DELAY_SECONDS = 3.5  # Prevents Telegram rate-limiting
+
+# Expanded categories with 80%+ pre-filters
 SEARCH_URLS = [
-    "https://www.flipkart.com/search?q=smartwatches&p%5B%5D=facets.discount_range_v1%3D50%2525%2Bor%2Bmore",
-    "https://www.flipkart.com/search?q=headphones&p%5B%5D=facets.discount_range_v1%3D50%2525%2Bor%2Bmore",
-    "https://www.flipkart.com/search?q=shoes&p%5B%5D=facets.discount_range_v1%3D50%2525%2Bor%2Bmore",
-    "https://www.flipkart.com/search?q=deals&p%5B%5D=facets.discount_range_v1%3D50%2525%2Bor%2Bmore"
+    "https://www.flipkart.com/search?q=smartwatches&p%5B%5D=facets.discount_range_v1%3D80%2525%2Bor%2Bmore",
+    "https://www.flipkart.com/search?q=headphones&p%5B%5D=facets.discount_range_v1%3D80%2525%2Bor%2Bmore",
+    "https://www.flipkart.com/search?q=shoes&p%5B%5D=facets.discount_range_v1%3D80%2525%2Bor%2Bmore",
+    "https://www.flipkart.com/search?q=t-shirts&p%5B%5D=facets.discount_range_v1%3D80%2525%2Bor%2Bmore",
+    "https://www.flipkart.com/search?q=kitchen+appliances&p%5B%5D=facets.discount_range_v1%3D80%2525%2Bor%2Bmore",
+    "https://www.flipkart.com/search?q=home+decor&p%5B%5D=facets.discount_range_v1%3D80%2525%2Bor%2Bmore",
+    "https://www.flipkart.com/search?q=trimmers&p%5B%5D=facets.discount_range_v1%3D80%2525%2Bor%2Bmore",
+    "https://www.flipkart.com/search?q=backpacks&p%5B%5D=facets.discount_range_v1%3D80%2525%2Bor%2Bmore",
+    "https://www.flipkart.com/search?q=sunglasses&p%5B%5D=facets.discount_range_v1%3D80%2525%2Bor%2Bmore",
+    "https://www.flipkart.com/search?q=powerbank&p%5B%5D=facets.discount_range_v1%3D80%2525%2Bor%2Bmore"
 ]
 
 HEADERS = {
@@ -63,12 +71,12 @@ def extract_numeric(text: str) -> int:
 async def post_to_telegram(session: AsyncSession, title: str, cur_price: int, mrp: int, discount: int, link: str):
     mrp_text = f"❌ *MRP:* ₹{mrp:,}\n" if mrp > 0 else ""
     message = (
-        f"🔥 *LOOT DEAL ({discount}% OFF)* 🔥\n\n"
+        f"⚡ *MEGA 80%+ LOOT DEAL* ⚡\n\n"
         f"📦 *Product:* {title}\n"
         f"💰 *Deal Price:* ₹{cur_price:,}\n"
         f"{mrp_text}"
-        f"📉 *Discount:* {discount}% OFF\n\n"
-        f"🛒 [Grab Deal on Flipkart]({link})"
+        f"💥 *Discount:* {discount}% OFF\n\n"
+        f"🛒 [Order on Flipkart]({link})"
     )
 
     telegram_url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
@@ -84,18 +92,17 @@ async def post_to_telegram(session: AsyncSession, title: str, cur_price: int, mr
         res_data = resp.json()
 
         if res_data.get("ok"):
-            print(f"[+] Posted to Telegram: {title[:28]}... ({discount}%)", flush=True)
+            print(f"[+] Posted: {title[:28]}... ({discount}%)", flush=True)
             await asyncio.sleep(MESSAGE_DELAY_SECONDS)
         elif res_data.get("error_code") == 429:
             retry_after = res_data.get("parameters", {}).get("retry_after", 20)
-            print(f"[!] Hit Telegram rate-limit. Waiting {retry_after}s...", flush=True)
+            print(f"[!] Rate limit hit. Pausing {retry_after}s...", flush=True)
             await asyncio.sleep(retry_after + 2)
-            # Retry one time after the wait window clears
             await session.post(telegram_url, json=payload, timeout=15.0)
         else:
             print(f"[-] Telegram Error: {res_data}", flush=True)
     except Exception as e:
-        print(f"[-] Telegram dispatch error: {e}", flush=True)
+        print(f"[-] Dispatch error: {e}", flush=True)
 
 async def scan_flipkart_page(session: AsyncSession, url: str):
     category = url.split("q=")[1].split("&")[0]
@@ -133,6 +140,7 @@ async def scan_flipkart_page(session: AsyncSession, url: str):
             if discount == 0 and mrp > cur_price and mrp > 0:
                 discount = round(((mrp - cur_price) / mrp) * 100)
 
+            # Strict 80%+ evaluation
             if discount >= DISCOUNT_THRESHOLD and cur_price > 0:
                 title_tag = card.select_one("div.KzDlHZ, a.wjcEIp, a.WKTcLC, div._4rR01T, a.s1Q9rs")
                 title = title_tag.get_text(strip=True) if title_tag else (link_tag.get("title") or "Flipkart Loot Deal")
@@ -141,24 +149,24 @@ async def scan_flipkart_page(session: AsyncSession, url: str):
                 deals_posted += 1
                 await post_to_telegram(session, title, cur_price, mrp, discount, clean_url)
 
-        print(f"[*] {category}: Processed {len(cards)} items -> Successfully dispatched {deals_posted} deals.", flush=True)
+        print(f"[*] {category}: Found {len(cards)} items -> Dispatched {deals_posted} deals.", flush=True)
 
     except Exception as err:
         print(f"[-] Scan error on {category}: {err}", flush=True)
 
 async def main():
-    print("[*] Bot running with rate-limit protection...", flush=True)
+    print("[*] Bot running with 80%+ strict filter across 10 categories...", flush=True)
     threading.Thread(target=run_health_server, daemon=True).start()
     print("[+] Port 10000 bound.", flush=True)
 
     async with AsyncSession() as session:
         while True:
-            print("[*] Starting sweep...", flush=True)
+            print("[*] Running category sweep...", flush=True)
             for url in SEARCH_URLS:
                 await scan_flipkart_page(session, url)
-                await asyncio.sleep(4)
+                await asyncio.sleep(4)  # Politeness interval between categories
 
-            print(f"[*] Sweep done. Pausing for {CHECK_INTERVAL_SECONDS}s...", flush=True)
+            print(f"[*] Sweep complete. Pausing for {CHECK_INTERVAL_SECONDS}s...", flush=True)
             await asyncio.sleep(CHECK_INTERVAL_SECONDS)
 
 if __name__ == "__main__":
