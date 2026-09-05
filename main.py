@@ -1,15 +1,13 @@
 import os
 import re
-import time
 import asyncio
-import logging
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from bs4 import BeautifulSoup
-import httpx
+from curl_cffi.requests import AsyncSession
 
 # -------------------------------------------------------------
-# 1. LIGHTWEIGHT HEALTHCHECK SERVER (Prevents Render Port Timeout)
+# 1. RENDER HEALTH CHECK SERVER
 # -------------------------------------------------------------
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -19,7 +17,6 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
         self.wfile.write(b"Bot is healthy and scanning.")
 
     def log_message(self, format, *args):
-        # Silence default HTTP server logging to keep terminal clean
         return
 
 def run_health_server():
@@ -28,14 +25,14 @@ def run_health_server():
     server.serve_forever()
 
 # -------------------------------------------------------------
-# 2. CONFIGURATION & CREDENTIALS
+# 2. BOT CONFIGURATION
 # -------------------------------------------------------------
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "8916500708:AAGxhpTfz8x9ifJcdiL7loHdnwM0Mch-UtY")
-CHANNEL_USERNAME = os.environ.get("CHANNEL_USERNAME", "@Daily_loot_deals25")
-DISCOUNT_THRESHOLD = 50  # Minimum discount percentage to trigger post
-CHECK_INTERVAL_SECONDS = 180  # Check every 3 minutes
+BOT_TOKEN = "8916500708:AAGxhpTfz8x9ifJcdiL7loHdnwM0Mch-UtY"
+CHANNEL_USERNAME = "@Daily_loot_deals25"
+DISCOUNT_THRESHOLD = 50
+CHECK_INTERVAL_SECONDS = 180
 
-# Search targets across key Flipkart categories
+# Targeted search URLs pre-filtered for 50%+ discounts
 SEARCH_URLS = [
     "https://www.flipkart.com/search?q=deals&p%5B%5D=facets.discount_range_v1%3D50%2525%2Bor%2Bmore",
     "https://www.flipkart.com/search?q=headphones&p%5B%5D=facets.discount_range_v1%3D50%2525%2Bor%2Bmore",
@@ -44,33 +41,31 @@ SEARCH_URLS = [
 ]
 
 HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
-    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.9",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+    "Sec-Ch-Ua": '"Chromium";v="122", "Not(A:Brand";v="24", "Google Chrome";v="122"',
+    "Sec-Ch-Ua-Mobile": "?0",
+    "Sec-Ch-Ua-Platform": '"Windows"',
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-User": "?1",
+    "Upgrade-Insecure-Requests": "1",
 }
 
-# Cache to avoid posting duplicate products in the same run
 seen_products = set()
 
-# -------------------------------------------------------------
-# 3. HELPER FUNCTIONS
-# -------------------------------------------------------------
 def extract_numeric(text: str) -> int:
-    """Extract digits from price strings like '₹1,299' -> 1299."""
     digits = re.sub(r"[^\d]", "", text)
     return int(digits) if digits else 0
 
-async def post_to_telegram(client: httpx.AsyncClient, title: str, cur_price: int, mrp: int, discount: int, link: str):
-    """Sends formatted deal message directly to your Telegram channel."""
+async def post_to_telegram(session: AsyncSession, title: str, cur_price: int, mrp: int, discount: int, link: str):
     message = (
         f"🔥 *LOOT DEAL ({discount}% OFF)* 🔥\n\n"
         f"📦 *Product:* {title}\n"
         f"💰 *Deal Price:* ₹{cur_price:,}\n"
         f"❌ *MRP:* ₹{mrp:,}\n"
-        f"📉 *Save:* ₹{mrp - cur_price:,} ({discount}% off)\n\n"
+        f"📉 *Discount:* {discount}% OFF\n\n"
         f"🛒 [Grab Deal on Flipkart]({link})"
     )
 
@@ -83,30 +78,29 @@ async def post_to_telegram(client: httpx.AsyncClient, title: str, cur_price: int
     }
 
     try:
-        response = await client.post(telegram_url, json=payload, timeout=15.0)
-        res_data = response.json()
+        resp = await session.post(telegram_url, json=payload, timeout=15.0)
+        res_data = resp.json()
         if res_data.get("ok"):
             print(f"[+] Posted to Telegram: {title[:35]}... ({discount}%)", flush=True)
         else:
-            print(f"[-] Telegram API Error: {res_data}", flush=True)
+            print(f"[-] Telegram Error: {res_data}", flush=True)
     except Exception as e:
-        print(f"[-] Failed to push deal to Telegram: {e}", flush=True)
+        print(f"[-] Telegram dispatch error: {e}", flush=True)
 
-async def scan_flipkart_page(client: httpx.AsyncClient, url: str):
-    """Scrapes Flipkart search page, parses prices, and posts deals >= 50%."""
+async def scan_flipkart_page(session: AsyncSession, url: str):
     try:
-        resp = await client.get(url, headers=HEADERS, timeout=20.0, follow_redirects=True)
+        # Impersonate Chrome browser fingerprint to bypass Cloudflare / Akamai 403
+        resp = await session.get(url, headers=HEADERS, impersonate="chrome", timeout=20.0)
+        
         if resp.status_code != 200:
-            print(f"[-] Non-200 response from Flipkart: {resp.status_code}", flush=True)
+            print(f"[-] Blocked by Flipkart (Status {resp.status_code})", flush=True)
             return
 
         soup = BeautifulSoup(resp.text, "html.parser")
+        cards = soup.select("div._1AtVbE, div._75nlfW, div[data-id], div.slAVV4")
 
-        # Select standard Flipkart product cards
-        cards = soup.select("div._1AtVbE, div._75nlfW, div[data-id]")
-
+        found_in_page = 0
         for card in cards:
-            # Extract product link
             link_tag = card.select_one("a[href*='/p/']")
             if not link_tag or not link_tag.get("href"):
                 continue
@@ -114,15 +108,12 @@ async def scan_flipkart_page(client: httpx.AsyncClient, url: str):
             raw_href = link_tag["href"]
             product_url = f"https://www.flipkart.com{raw_href.split('?')[0]}"
 
-            # Deduplication
             if product_url in seen_products:
                 continue
 
-            # Extract title
             title_tag = card.select_one("div._4rR01T, a.s1Q9rs, div.KzDlHZ, a.WKTcLC")
-            title = title_tag.get_text(strip=True) if title_tag else "Flipkart Deal"
+            title = title_tag.get_text(strip=True) if title_tag else "Flipkart Loot Deal"
 
-            # Extract pricing
             cur_price_tag = card.select_one("div._30jeq3, div.Nx9bqj")
             mrp_tag = card.select_one("div._3I9_wc, div.yRaY8j")
 
@@ -137,28 +128,26 @@ async def scan_flipkart_page(client: httpx.AsyncClient, url: str):
 
                 if discount >= DISCOUNT_THRESHOLD:
                     seen_products.add(product_url)
-                    await post_to_telegram(client, title, cur_price, mrp, discount, product_url)
+                    found_in_page += 1
+                    await post_to_telegram(session, title, cur_price, mrp, discount, product_url)
+
+        print(f"[*] Found & posted {found_in_page} deals from page.", flush=True)
 
     except Exception as err:
-        print(f"[-] Error during page scan: {err}", flush=True)
+        print(f"[-] Error parsing page: {err}", flush=True)
 
-# -------------------------------------------------------------
-# 4. MAIN LOOP
-# -------------------------------------------------------------
 async def main():
-    print("[*] Bot starting up...", flush=True)
+    print("[*] Bot starting with Chrome TLS impersonation...", flush=True)
 
-    # Launch Render port listener on background daemon thread
-    server_thread = threading.Thread(target=run_health_server, daemon=True)
-    server_thread.start()
-    print("[+] Render health check bound on port 10000.", flush=True)
+    threading.Thread(target=run_health_server, daemon=True).start()
+    print("[+] Render port listener active.", flush=True)
 
-    async with httpx.AsyncClient() as client:
+    async with AsyncSession() as session:
         while True:
-            print("[*] Running deal scan sweep...", flush=True)
+            print("[*] Running Flipkart sweep...", flush=True)
             for search_url in SEARCH_URLS:
-                await scan_flipkart_page(client, search_url)
-                await asyncio.sleep(2)  # Short delay between category requests
+                await scan_flipkart_page(session, search_url)
+                await asyncio.sleep(3)
 
             print(f"[*] Sweep complete. Sleeping for {CHECK_INTERVAL_SECONDS}s...", flush=True)
             await asyncio.sleep(CHECK_INTERVAL_SECONDS)
