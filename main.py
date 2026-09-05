@@ -27,7 +27,7 @@ def run_health_server():
 # -------------------------------------------------------------
 # 2. BOT CONFIGURATION
 # -------------------------------------------------------------
-BOT_TOKEN = "8916500708:AAGxhpTfz8x9ifJcdiL7loHdnwM0Mch-UtY"
+BOT_TOKEN = "8916500708:AAF4bTn5L9k7kabQD-xokUPCF16-OzWfGfU"
 CHANNEL_USERNAME = "@Daily_loot_deals25"
 
 DISCOUNT_THRESHOLD = 80       # Minimum 80% discount
