@@ -30,8 +30,9 @@ def run_health_server():
 # -------------------------------------------------------------
 BOT_TOKEN = "8916500708:AAGxhpTfz8x9ifJcdiL7loHdnwM0Mch-UtY"
 CHANNEL_USERNAME = "@Daily_loot_deals25"
-DISCOUNT_THRESHOLD = 40  # Set to 40% to guarantee instant hits
-CHECK_INTERVAL_SECONDS = 60
+DISCOUNT_THRESHOLD = 50  # 50% or higher
+CHECK_INTERVAL_SECONDS = 90
+MESSAGE_DELAY_SECONDS = 3.5  # Prevents Telegram 429 rate-limiting
 
 SEARCH_URLS = [
     "https://www.flipkart.com/search?q=smartwatches&p%5B%5D=facets.discount_range_v1%3D50%2525%2Bor%2Bmore",
@@ -81,8 +82,16 @@ async def post_to_telegram(session: AsyncSession, title: str, cur_price: int, mr
     try:
         resp = await session.post(telegram_url, json=payload, timeout=15.0)
         res_data = resp.json()
+
         if res_data.get("ok"):
-            print(f"[+] Posted to Telegram: {title[:30]}... ({discount}%)", flush=True)
+            print(f"[+] Posted to Telegram: {title[:28]}... ({discount}%)", flush=True)
+            await asyncio.sleep(MESSAGE_DELAY_SECONDS)
+        elif res_data.get("error_code") == 429:
+            retry_after = res_data.get("parameters", {}).get("retry_after", 20)
+            print(f"[!] Hit Telegram rate-limit. Waiting {retry_after}s...", flush=True)
+            await asyncio.sleep(retry_after + 2)
+            # Retry one time after the wait window clears
+            await session.post(telegram_url, json=payload, timeout=15.0)
         else:
             print(f"[-] Telegram Error: {res_data}", flush=True)
     except Exception as e:
@@ -97,51 +106,9 @@ async def scan_flipkart_page(session: AsyncSession, url: str):
             return
 
         soup = BeautifulSoup(resp.text, "html.parser")
+        cards = soup.select("div[data-id], div.slAVV4, div._75nlfW, div._1AtVbE")
         deals_posted = 0
 
-        # Method 1: Check embedded window.__INITIAL_STATE__ or json scripts
-        json_found = False
-        for script in soup.find_all("script"):
-            script_text = script.string or ""
-            if "__INITIAL_STATE__" in script_text or "pageDataV4" in script_text:
-                try:
-                    # Extract JSON payload inside script
-                    json_str_match = re.search(r"window\.__INITIAL_STATE__\s*=\s*({.+?});", script_text)
-                    if json_str_match:
-                        raw_data = json.loads(json_str_match.group(1))
-                        # Navigate slots if present
-                        slots = raw_data.get("pageDataV4", {}).get("page", {}).get("data", {}).get("10002", [])
-                        for slot in slots:
-                            widget = slot.get("widget", {}).get("data", {})
-                            for prod in widget.get("products", []):
-                                pinfo = prod.get("productInfo", {}).get("value", {})
-                                p_url = pinfo.get("smartUrl", "")
-                                if not p_url:
-                                    continue
-                                full_url = f"https://www.flipkart.com{p_url.split('?')[0]}"
-                                if full_url in seen_products:
-                                    continue
-                                
-                                title = pinfo.get("titles", {}).get("title", "Flipkart Loot Deal")
-                                price = pinfo.get("pricing", {}).get("finalPrice", {}).get("value", 0)
-                                mrp = pinfo.get("pricing", {}).get("mrp", {}).get("value", 0)
-                                disc = pinfo.get("pricing", {}).get("totalDiscount", 0)
-                                
-                                if mrp > 0 and price > 0:
-                                    disc = round(((mrp - price) / mrp) * 100)
-                                
-                                if disc >= DISCOUNT_THRESHOLD and price > 0:
-                                    seen_products.add(full_url)
-                                    deals_posted += 1
-                                    await post_to_telegram(session, title, price, mrp, disc, full_url)
-                        if deals_posted > 0:
-                            json_found = True
-                            break
-                except Exception:
-                    pass
-
-        # Method 2: DOM Card Parsing with Regex Extraction
-        cards = soup.select("div[data-id], div.slAVV4, div._75nlfW, div._1AtVbE")
         for card in cards:
             link_tag = card.select_one("a[href*='/p/']")
             if not link_tag or not link_tag.get("href"):
@@ -153,17 +120,13 @@ async def scan_flipkart_page(session: AsyncSession, url: str):
                 continue
 
             card_text = card.get_text(" ", strip=True)
-
-            # Extract prices using standard regex pattern on the entire card text
             prices = re.findall(r"₹([\d,]+)", card_text)
             if not prices:
                 continue
 
-            # In Flipkart cards, the first price is current, second is MRP
             cur_price = extract_numeric(prices[0])
             mrp = extract_numeric(prices[1]) if len(prices) > 1 else 0
 
-            # Extract discount from text like "55% off"
             disc_match = re.search(r"(\d+)%\s*off", card_text, re.IGNORECASE)
             discount = int(disc_match.group(1)) if disc_match else 0
 
@@ -171,7 +134,6 @@ async def scan_flipkart_page(session: AsyncSession, url: str):
                 discount = round(((mrp - cur_price) / mrp) * 100)
 
             if discount >= DISCOUNT_THRESHOLD and cur_price > 0:
-                # Find best matching title
                 title_tag = card.select_one("div.KzDlHZ, a.wjcEIp, a.WKTcLC, div._4rR01T, a.s1Q9rs")
                 title = title_tag.get_text(strip=True) if title_tag else (link_tag.get("title") or "Flipkart Loot Deal")
 
@@ -179,13 +141,13 @@ async def scan_flipkart_page(session: AsyncSession, url: str):
                 deals_posted += 1
                 await post_to_telegram(session, title, cur_price, mrp, discount, clean_url)
 
-        print(f"[*] {category}: Processed {len(cards)} items -> Dispatched {deals_posted} deals.", flush=True)
+        print(f"[*] {category}: Processed {len(cards)} items -> Successfully dispatched {deals_posted} deals.", flush=True)
 
     except Exception as err:
         print(f"[-] Scan error on {category}: {err}", flush=True)
 
 async def main():
-    print("[*] Launching updated discount extractor...", flush=True)
+    print("[*] Bot running with rate-limit protection...", flush=True)
     threading.Thread(target=run_health_server, daemon=True).start()
     print("[+] Port 10000 bound.", flush=True)
 
@@ -194,7 +156,7 @@ async def main():
             print("[*] Starting sweep...", flush=True)
             for url in SEARCH_URLS:
                 await scan_flipkart_page(session, url)
-                await asyncio.sleep(2)
+                await asyncio.sleep(4)
 
             print(f"[*] Sweep done. Pausing for {CHECK_INTERVAL_SECONDS}s...", flush=True)
             await asyncio.sleep(CHECK_INTERVAL_SECONDS)
