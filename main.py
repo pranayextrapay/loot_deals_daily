@@ -30,22 +30,16 @@ def run_health_server():
 BOT_TOKEN = "8916500708:AAF4bTn5L9k7kabQD-xokUPCF16-OzWfGfU"
 CHANNEL_USERNAME = "@Daily_loot_deals25"
 
-DISCOUNT_THRESHOLD = 70       # 70%+ deals guaranteed to find steady hits
-CHECK_INTERVAL_SECONDS = 180   # 3-minute sweep cycle
-MESSAGE_DELAY_SECONDS = 3.5    # Telegram rate limit protector
+# Temporarily lowered to 50% so you immediately see links pop up
+DISCOUNT_THRESHOLD = 50       
+CHECK_INTERVAL_SECONDS = 120   
+MESSAGE_DELAY_SECONDS = 3.5    
 
-# Categories targeted with Flipkart's high-discount sorting & filter tags
 SEARCH_URLS = [
-    "https://www.flipkart.com/search?q=smartwatches&p%5B%5D=facets.discount_range_v1%3D70%2525%2Bor%2Bmore",
-    "https://www.flipkart.com/search?q=headphones&p%5B%5D=facets.discount_range_v1%3D70%2525%2Bor%2Bmore",
-    "https://www.flipkart.com/search?q=mens+footwear&p%5B%5D=facets.discount_range_v1%3D70%2525%2Bor%2Bmore",
-    "https://www.flipkart.com/search?q=t-shirts&p%5B%5D=facets.discount_range_v1%3D70%2525%2Bor%2Bmore",
-    "https://www.flipkart.com/search?q=backpacks&p%5B%5D=facets.discount_range_v1%3D70%2525%2Bor%2Bmore",
-    "https://www.flipkart.com/search?q=sunglasses&p%5B%5D=facets.discount_range_v1%3D70%2525%2Bor%2Bmore",
-    "https://www.flipkart.com/search?q=wall+clocks&p%5B%5D=facets.discount_range_v1%3D70%2525%2Bor%2Bmore",
-    "https://www.flipkart.com/search?q=bedsheets&p%5B%5D=facets.discount_range_v1%3D70%2525%2Bor%2Bmore",
-    "https://www.flipkart.com/search?q=trimmers&p%5B%5D=facets.discount_range_v1%3D60%2525%2Bor%2Bmore",
-    "https://www.flipkart.com/search?q=powerbank&p%5B%5D=facets.discount_range_v1%3D60%2525%2Bor%2Bmore"
+    "https://www.flipkart.com/search?q=smartwatches&p%5B%5D=facets.discount_range_v1%3D50%2525%2Bor%2Bmore",
+    "https://www.flipkart.com/search?q=headphones&p%5B%5D=facets.discount_range_v1%3D50%2525%2Bor%2Bmore",
+    "https://www.flipkart.com/search?q=shoes&p%5B%5D=facets.discount_range_v1%3D50%2525%2Bor%2Bmore",
+    "https://www.flipkart.com/search?q=t-shirts&p%5B%5D=facets.discount_range_v1%3D50%2525%2Bor%2Bmore"
 ]
 
 HEADERS = {
@@ -91,7 +85,7 @@ async def post_to_telegram(session: AsyncSession, title: str, cur_price: int, mr
         res_data = resp.json()
 
         if res_data.get("ok"):
-            print(f"[+] Posted: {title[:25]}... (₹{cur_price:,} / {discount}%)", flush=True)
+            print(f"[+] Successfully sent: {title[:20]}... (₹{cur_price} / {discount}%)", flush=True)
             await asyncio.sleep(MESSAGE_DELAY_SECONDS)
         elif res_data.get("error_code") == 429:
             retry_after = res_data.get("parameters", {}).get("retry_after", 20)
@@ -115,6 +109,9 @@ async def scan_flipkart_page(session: AsyncSession, url: str):
         cards = soup.select("div[data-id], div.slAVV4, div._75nlfW, div._1AtVbE")
         deals_posted = 0
 
+        # Sample preview of first 2 cards to see why items pass or fail
+        debug_count = 0
+
         for card in cards:
             link_tag = card.select_one("a[href*='/p/']")
             if not link_tag or not link_tag.get("href"):
@@ -122,8 +119,6 @@ async def scan_flipkart_page(session: AsyncSession, url: str):
 
             raw_href = link_tag["href"]
             clean_url = f"https://www.flipkart.com{raw_href.split('?')[0]}"
-            if clean_url in seen_products:
-                continue
 
             card_text = card.get_text(" ", strip=True)
 
@@ -139,7 +134,7 @@ async def scan_flipkart_page(session: AsyncSession, url: str):
             cur_price = extract_numeric(cur_price_el.get_text()) if cur_price_el else 0
             mrp = extract_numeric(mrp_el.get_text()) if mrp_el else 0
 
-            # Fallback regex search on the card
+            # Fallback regex if elements are obfuscated
             if cur_price == 0:
                 price_matches = re.findall(r"₹([\d,]+)", card_text)
                 if price_matches:
@@ -147,34 +142,39 @@ async def scan_flipkart_page(session: AsyncSession, url: str):
                     if len(price_matches) > 1:
                         mrp = extract_numeric(price_matches[1])
 
-            if cur_price == 0:
-                continue
-
             discount = 0
             if disc_el:
                 disc_match = re.search(r"(\d+)%", disc_el.get_text())
                 if disc_match:
                     discount = int(disc_match.group(1))
 
-            if discount == 0 and mrp > cur_price:
+            if discount == 0 and mrp > cur_price and mrp > 0:
                 discount = round(((mrp - cur_price) / mrp) * 100)
 
-            # Check threshold
-            if discount >= DISCOUNT_THRESHOLD and (mrp == 0 or cur_price < mrp):
-                title_tag = card.select_one("div.KzDlHZ, a.wjcEIp, a.WKTcLC, div._4rR01T, a.s1Q9rs")
-                title = title_tag.get_text(strip=True) if title_tag else (link_tag.get("title") or "Flipkart Loot Deal")
+            title_tag = card.select_one("div.KzDlHZ, a.wjcEIp, a.WKTcLC, div._4rR01T, a.s1Q9rs")
+            title = title_tag.get_text(strip=True) if title_tag else (link_tag.get("title") or "Flipkart Loot Deal")
 
+            # Diagnostic log for the first 2 items found per category
+            if debug_count < 2 and cur_price > 0:
+                print(f"[DEBUG {category}] Title: {title[:20]} | Price: ₹{cur_price} | MRP: ₹{mrp} | Disc: {discount}%", flush=True)
+                debug_count += 1
+
+            if clean_url in seen_products:
+                continue
+
+            # Condition gate
+            if discount >= DISCOUNT_THRESHOLD and cur_price > 0:
                 seen_products.add(clean_url)
                 deals_posted += 1
                 await post_to_telegram(session, title, cur_price, mrp, discount, clean_url)
 
-        print(f"[*] {category}: Processed {len(cards)} items -> Dispatched {deals_posted} deals.", flush=True)
+        print(f"[*] {category}: Found {len(cards)} items -> Dispatched {deals_posted} deals.", flush=True)
 
     except Exception as err:
         print(f"[-] Scrape error on {category}: {err}", flush=True)
 
 async def main():
-    print("[*] Bot running: Targeted high-discount categories active...", flush=True)
+    print("[*] Bot running with live debug extraction...", flush=True)
     threading.Thread(target=run_health_server, daemon=True).start()
     print("[+] Port 10000 bound.", flush=True)
 
